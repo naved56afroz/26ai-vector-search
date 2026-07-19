@@ -30,7 +30,7 @@ https://www.kaggle.com/api/v1/datasets/download/nirmalsankalana/fashion-product-
 
 ## 🏗️ Architecture
 
-![Architecture Diagram]([https://raw.github.ibm.com/Naved-Afroz1/oracle_26ai_demo/7b2e279608696f46edab0a64ba7ff2afba2101cd/images/arch_diag.svg?token=AADSGPFRKA4EV5RBRPKEM7DJYPZUO](https://raw.githubusercontent.com/naved56afroz/26ai-vector-search/refs/heads/main/images/oracle_ai_aix_native_architecture_1.drawio.png))
+![Architecture Diagram]([https://raw.github.ibm.com/Naved-Afroz1/oracle_26ai_demo/7b2e279608696f46edab0a64ba7ff2afba2101cd/images/arch_diag.svg?token=AADSGPFRKA4EV5RBRPKEM7DJYPZUO](https://raw.githubusercontent.com/naved56afroz/26ai-vector-search/refs/heads/main/images/oracle_ai_aix_native_architecture_1.drawio.png)
 
 ## 🧱 Setup Flow
 
