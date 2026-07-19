@@ -1,0 +1,5 @@
+CREATE VECTOR INDEX fashion_hnsw_desc_embedding_idx
+ON fashion_products(desc_embedding)
+ORGANIZATION INMEMORY NEIGHBOR GRAPH
+DISTANCE COSINE
+WITH TARGET ACCURACY 95;

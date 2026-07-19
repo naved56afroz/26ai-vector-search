@@ -1,0 +1,9 @@
+# Large video files — keep locally, do not push to GitHub
+demo video/*.mov
+demo video/*.mp4
+demo video/*.avi
+demo video/*.mkv
+
+# macOS
+.DS_Store
+~$*

@@ -1,0 +1,451 @@
+Let us walk through how to evolve a traditional search application into an AI-powered search :
+
+Pre-requistes:
+Oracle 26 AI Database running on IBM Power Systems with AIX 
+CLIP (Vision + Language model) via ONNX Runtime 
+Flask-based embedding service 
+Oracle APEX UI 
+
+-- Download data from kaggle for ecommerce application
+
+Download dataset :
+#!/bin/bash
+curl -L -o /tmp/fashion-product-text-images-dataset.zip https://www.kaggle.com/api/v1/datasets/download/nirmalsankalana/fashion-product-text-images-dataset
+
+
+Architecture:
+User (Text / Image)
+        │
+        ▼
+Oracle APEX (UI Layer)
+        │
+        ▼
+PL/SQL Functions (UTL_HTTP)
+        │
+        ▼
+Flask API (Embedding Service)
+        │
+        ▼
+CLIP ViT-B/32 (ONNX Runtime on AIX)
+        │
+        ▼
+512-dim Embeddings
+        │
+        ▼
+Oracle 26 AI Database (VECTOR columns + HNSW Index)
+        │
+        ▼
+VECTOR_DISTANCE (Cosine Similarity)
+
+Step 1: Database Setup — Vector Ready
+
+Before anything fancy, get the foundation right.
+Key parameters
+ALTER SYSTEM SET VECTOR_MEMORY_SIZE = 1G SCOPE=SPFILE;
+ALTER SYSTEM SET FILESYSTEMIO_OPTIONS = SETALL SCOPE=SPFILE;
+
+SHUTDOWN IMMEDIATE;
+STARTUP;
+
+Why this matters:
+•	VECTOR_MEMORY_SIZE → enables fast vector ops 
+•	FILESYSTEMIO_OPTIONS=SETALL → optimized I/O for large data loads 
+
+Step 2: Setup Vector user 
+-- Create a dedicated user and tablespace in PDB.
+SQL> CREATE BIGFILE TABLESPACE TBS_VECTOR DATAFILE '/u01/app/oracle/oradata/DB26AIXLC/4C04E931354203CAE06381284C527FFE/datafile/vector01.dbf' SIZE 3g AUTOEXTEND ON MAXSIZE 10G;
+
+Tablespace created.
+
+-- Create user VECTOR_USER and grant neccessary privilege
+SQL> CREATE USER VECTOR_USER IDENTIFIED BY Oracle_4U
+DEFAULT TABLESPACE USERS
+QUOTA UNLIMITED ON USERS;
+
+grant connect, resource to VECTOR_USER;
+grant create table to VECTOR_USER;
+
+grant create session to VECTOR_USER;
+GRANT DB_DEVELOPER_ROLE TO VECTOR_USER;
+GRANT CREATE MINING MODEL TO VECTOR_USER;
+GRANT UNLIMITED TABLESPACE TO VECTOR_USER;
+
+ALTER USER vector_user
+  DEFAULT TABLESPACE TBS_VECTOR
+  TEMPORARY TABLESPACE TEMP
+  QUOTA UNLIMITED ON TBS_VECTOR;
+
+-- create ACL as sys user in PDB
+SQL> sho pdbs
+
+    CON_ID CON_NAME                       OPEN MODE  RESTRICTED
+---------- ------------------------------ ---------- ----------
+         3 TESTPDB                        READ WRITE NO
+SQL> alter session set container=TESTPDB;
+
+Session altered.
+
+SQL> sho pdbs
+
+    CON_ID CON_NAME                       OPEN MODE  RESTRICTED
+---------- ------------------------------ ---------- ----------
+         3 TESTPDB                        READ WRITE NO
+
+SQL> BEGIN
+  DBMS_NETWORK_ACL_ADMIN.APPEND_HOST_ACE(
+    host => 'localhost',
+    ace  => xs$ace_type(
+              privilege_list => xs$name_list('connect', 'resolve'),
+              principal_name => 'VECTOR_USER',
+              principal_type => xs_acl.ptype_db
+            )
+  );
+END;
+/  2    3    4    5    6    7    8    9   10   11
+
+PL/SQL procedure successfully completed.
+
+SQL> commit;
+
+Commit complete.
+
+SET LINESIZE 200
+SET PAGESIZE 100
+
+COLUMN HOST        FORMAT A30
+COLUMN LOWER_PORT  FORMAT 99999
+COLUMN UPPER_PORT  FORMAT 99999
+COLUMN PRINCIPAL   FORMAT A20
+COLUMN PRIVILEGE   FORMAT A15
+COLUMN IS_GRANT    FORMAT A5
+SELECT host, lower_port, upper_port, principal, privilege, is_grant
+FROM dba_network_acl_privileges
+JOIN dba_network_acls USING (acl)
+ORDER BY host, principal; 
+
+
+HOST                           LOWER_PORT UPPER_PORT PRINCIPAL            PRIVILEGE       IS_GR
+------------------------------ ---------- ---------- -------------------- --------------- -----
+localhost                                            VECTOR_USER          resolve         true
+localhost                                            VECTOR_USER          connect         true
+
+10 rows selected.
+
+-- test: as vector_user in PDB
+
+SQL> SELECT UTL_HTTP.REQUEST('http://localhost:5001/embed/text') FROM dual;
+
+UTL_HTTP.REQUEST('HTTP://LOCALHOST:5001/EMBED/TEXT')
+--------------------------------------------------------------------------------
+<!doctype html>
+<html lang=en>
+<title>405 Method Not Allowed</title>
+<h1>Method Not Allowed</h1>
+<p>The method is not allowed for the requested URL.</p>
+
+Step 3: Prepare and load dataset into 26ai database
+
+cp /tmp/fashion-product-text-images-dataset.zip /home/oracle/nava/dataset
+unzip /home/oracle/nava/dataset/fashion-product-text-images-dataset.zip
+
+-- create directory
+-- In the PDB as sys:
+alter session set container= TESTPDB;
+CREATE OR REPLACE DIRECTORY DATA_DIR AS '/home/oracle/nava/dataset';
+GRANT READ, WRITE ON DIRECTORY DATA_DIR TO vector_user;
+
+CREATE OR REPLACE DIRECTORY IMG_DIR AS '/home/oracle/nava/dataset/image';
+GRANT READ, WRITE ON DIRECTORY IMG_DIR TO vector_user;
+
+-- In the PDB as vector_user:
+-- Create external table to read data from csv directly via built in oracle driver ORACLE_LOADER
+-- 01_fashion_ext.sql
+CREATE TABLE fashion_ext (
+    image_name      VARCHAR2(500),
+    description     VARCHAR2(4000),
+    display_name    VARCHAR2(1000),
+    category        VARCHAR2(500)
+)
+ORGANIZATION EXTERNAL
+(
+    TYPE ORACLE_LOADER
+    DEFAULT DIRECTORY DATA_DIR
+    ACCESS PARAMETERS
+    (
+        RECORDS DELIMITED BY NEWLINE
+        SKIP 1
+        FIELDS TERMINATED BY ','
+        OPTIONALLY ENCLOSED BY '"'
+        MISSING FIELD VALUES ARE NULL
+        (
+            image_name      CHAR(500),
+            description     CHAR(4000),
+            display_name    CHAR(1000),
+            category        CHAR(500)
+        )
+    )
+    LOCATION ('data.csv')
+)
+REJECT LIMIT UNLIMITED;
+
+
+SQL> SELECT COUNT(*) FROM fashion_ext;
+
+  COUNT(*)
+----------
+     44599
+
+-- create table to store embeddings (structured + unstructured) data
+-- 02_fashion_products.sql
+CREATE TABLE fashion_products (
+    product_id     NUMBER,
+    image_name     VARCHAR2(500),
+    display_name   VARCHAR2(1000),
+    category       VARCHAR2(500),
+    description    CLOB,
+    image_blob     BLOB,
+    desc_embedding    VECTOR(*),
+    image_embedding   VECTOR(*)  
+    CONSTRAINT fashion_products_pk PRIMARY KEY (product_id)
+)
+LOB (description) STORE AS SECUREFILE
+LOB (image_blob)  STORE AS SECUREFILE;
+
+-- 03_load_data.sql
+INSERT /*+ APPEND */ INTO fashion_products (
+    product_id,
+    image_name,
+    display_name,
+    category,
+    description
+)
+SELECT
+    TO_NUMBER(REPLACE(image_name, '.jpg')),
+    image_name,
+    display_name,
+    category,
+    display_name || '. ' || description || '. Category: ' || category
+FROM fashion_ext
+WHERE REGEXP_LIKE(image_name, '^[0-9]+\.jpg$');
+
+COMMIT;
+
+44369 rows created.
+
+Elapsed: 00:00:01.41
+03:29:11 SQL> COMMIT;
+
+Commit complete.
+
+Elapsed: 00:00:00.00
+03:29:17 SQL> SELECT COUNT(*) FROM fashion_products;
+
+  COUNT(*)
+----------
+     44369
+
+Elapsed: 00:00:00.01
+
+-- check data avaialable to external table
+
+SET LINESIZE 200;
+SET PAGESIZE 500;
+COLUMN DESCRIPTION FORMAT A60 WORD_WRAPPED;
+COLUMN IMAGE_NAME FORMAT A15;
+COLUMN DISPLAY_NAME FORMAT A40;
+COLUMN CATEGORY FORMAT A20;
+
+SELECT * FROM fashion_ext FETCH FIRST 1 ROWS ONLY;
+
+PRODUCT_ID IMAGE_NAME   DISPLAY_NAME                        CATEGORY           DESCRIPTION                                                   IMAGE_BLOB           desc_embedding       image_embedding
+---------- ------------ ----------------------------------- ---------------    -----------------------------------------------------------   -------------------- -------------------- --------------------
+3238        3238.jpg    Puma Men Black 65CC Lo Ducati        Sports Shoes      Round toed, black sports shoes with red accents, low top                     
+                        Sports Shoes                                           styling and central lace-ups Leather upper with stitched                                                                                    
+                                                                               detail, overlay, Formstrip and Ducati branding on the sides                                                                             
+                                                                               and reinforced heel collar with branding Soft tongue and     
+                                                                               inner, branding on the tongue Cushioned footbed with     
+                                                                               branding at the heel Printed detail at the midsole Textured     
+                                                                               rubber outsole with patterned grooves and branding Warranty     
+                                                                               3 months against manufacturing defects only     
+                                                                                    
+                                                                                    
+                                                                                    
+
+-- load images into IMAGE_BLOB
+-- 04_load_blob_image.sql
+SET SERVEROUTPUT ON
+
+DECLARE
+    v_bfile   BFILE;
+    v_blob    BLOB;
+    v_count   NUMBER := 0;
+BEGIN
+    FOR r IN (
+        SELECT product_id, image_name
+        FROM fashion_products
+        WHERE image_blob IS NULL
+    )
+    LOOP
+        v_bfile := BFILENAME('IMG_DIR', r.image_name);
+
+        UPDATE fashion_products
+        SET image_blob = EMPTY_BLOB()
+        WHERE product_id = r.product_id
+        RETURNING image_blob INTO v_blob;
+
+        DBMS_LOB.OPEN(v_bfile, DBMS_LOB.LOB_READONLY);
+
+        DBMS_LOB.LOADFROMFILE(
+            dest_lob    => v_blob,
+            src_lob     => v_bfile,
+            amount      => DBMS_LOB.GETLENGTH(v_bfile)
+        );
+
+        DBMS_LOB.CLOSE(v_bfile);
+
+        v_count := v_count + 1;
+
+        IF MOD(v_count, 2000) = 0 THEN
+            COMMIT;
+            DBMS_OUTPUT.PUT_LINE('Committed: ' || v_count);
+        END IF;
+    END LOOP;
+
+    COMMIT;
+    DBMS_OUTPUT.PUT_LINE('Completed. Total Loaded: ' || v_count);
+END;
+/
+Committed: 2000
+.
+.
+Committed: 44000
+Completed. Total Loaded: 44369
+
+PL/SQL procedure successfully completed.
+
+Elapsed: 00:00:36.12
+
+Rows                 : 44,369
+Images loaded        : 44,369
+Images stored as     : SecureFile BLOB
+Platform             : Oracle AI Database 23ai on AIX
+
+-- generate embedding for both text and image
+-- Trigger for 44K+ data runs longer
+-- 05_generate_embeddings.py
+.venv/bin/activate
+nohup python3 generate_embeddings.py > generate_embeddings.log 2>&1 &
+
+-- load embeddings of 44K into DB
+-- 06_load_embeddings.py
+
+nohup python3 load_embeddings.py > load_embeddings.log 2>&1 &
+
+-- monitor load
+
+SQL>  SELECT
+     COUNT(CASE WHEN DESC_EMBEDDING  IS NOT NULL THEN 1 END) AS desc_done,
+     COUNT(CASE WHEN IMAGE_EMBEDDING IS NOT NULL THEN 1 END) AS image_done,
+     COUNT(*) AS total
+ FROM fashion_products_v;
+
+ DESC_DONE IMAGE_DONE      TOTAL
+---------- ---------- ----------
+     22731      18465      44369
+SQL> /
+ DESC_DONE IMAGE_DONE      TOTAL
+---------- ---------- ----------
+     44369      44369      44369
+
+-- create index
+-- 07_fashion_hnsw_desc_embedding_idx.sql
+
+CREATE VECTOR INDEX fashion_hnsw_desc_embedding_idx
+ON fashion_products(desc_embedding)
+ORGANIZATION INMEMORY NEIGHBOR GRAPH
+DISTANCE COSINE
+WITH TARGET ACCURACY 95;
+
+-- 08_fashion_hnsw_image_embedding_idx.sql
+
+CREATE VECTOR INDEX fashion_hnsw_image_embedding_idx
+ON fashion_products(image_embedding)
+ORGANIZATION INMEMORY NEIGHBOR GRAPH
+DISTANCE COSINE
+WITH TARGET ACCURACY 95;
+
+-- start embedding service via flask
+-- 09_embedding_service.py
+nohup python3 embedding_service.py > embedding_service.log 2>&1 &
+
+-- test flask endpoint
+
+# Text as root
+curl -s -X POST http://localhost:5001/embed/text \
+  -H "Content-Type: application/json" \
+  -d '{"text": "red shoes"}' | head -c 100
+
+# Image -- . .venv/bin/activate
+((.venv) ) # python3 -c "
+import base64, requests
+with open('/home/oracle/nava/dataset/data/3238.jpg', 'rb') as f:
+    b64 = base64.b64encode(f.read()).decode()
+r = requests.post('http://localhost:5001/embed/image', json={'image_base64': b64})
+print(r.json()['embedding'][:5])
+"> > > > > >
+[-0.05910906195640564, 0.01448641438037157, 0.015833713114261627, 0.0155110415071249, -0.01904955506324768]
+((.venv) ) #
+
+# Create other objects required for APEX web application for front-end.
+
+-- 09_embedding_service.py
+-- 103_fashion_selected_image.sql
+-- 104_image_search_temp.sql
+-- 105_get_text_embedding.sql
+-- 106_get_image_embedding.sql
+-- 107_get_upload_image_embedding.sql
+-- 108_store_selected_product.sql
+-- 109_store_selected_category.sql
+
+# Perform the Apex application import
+
+-- 999_app_export.sql
+
+Import the APEX app export, run the DDL scripts in order, start the Flask service, and the demo is live.
+
+•	Login to APEX : Access APEX URL and open App Builder 
+•	Initiate Import : Click Import → Import File 
+•	Upload File : Select the app_export.sql* export file 
+•	Review Configuration : Verify App Name / App ID (change if needed) 
+•	Select Schema : Choose correct parsing schema (tables, functions) 
+•	Install Application : Click Install Application 
+•	Run & Validate : Launch app and test key features
+
+
+-- Apex UI:
+
+Tables:
+FASHION_EXT
+IMAGE_SEARCH_TEMP
+FASHION_PRODUCTS
+FASHION_SELECTED_IMAGE
+
+Indices:
+
+fashion_HNSW_DESC_EMBEDDING_IDX
+fashion_HNSW_IMAGE_EMBEDDING_IDX
+
+Procedures:
+STORE_SELECTED_CATEGORY
+STORE_SELECTED_PRODUCT
+
+Functions:
+
+GET_TEXT_EMBEDDING
+GET_IMAGE_EMBEDDING
+GET_UPLOAD_IMAGE_EMBEDDING
+
+
+
+
+`
